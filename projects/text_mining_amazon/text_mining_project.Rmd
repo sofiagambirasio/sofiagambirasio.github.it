@@ -1,0 +1,558 @@
+---
+title: "Amazon reviews sentiment analysis"
+author: "Sofia Gambirasio"
+output: html_document
+---
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(fig.align = 'left', echo = TRUE, error = TRUE)
+``` 
+
+In the following I analyse the Amazon reviews of the [**Sony WH-CH520 Wireless Bluetooth Headphones**](https://www.amazon.co.uk/Sony-WH-CH520-Wireless-Bluetooth-Headphones-Blue/dp/B0BTJ8ZXG5?th=1). 
+
+![](https://m.media-amazon.com/images/I/610zLOuJmpL.__AC_SX300_SY300_QL70_ML2_.jpg)
+
+## Data Scraping
+
+Firstly I scrape the following information: title of the review, content of the review and stars, and I save them in a tibble. 
+Beware that non-uk reviews need to be scraped separately 
+```{r, warning=FALSE, message = FALSE}
+library(tidyverse)
+library(xml2) 
+library(rvest)
+```
+
+```{r}
+amazon_reviews <- function(id, page) {
+  url <- paste0("https://www.amazon.co.uk/product-reviews/",id, "/?pageNumber=", page)
+  html <- read_html(url)
+  
+  # scrape review TITLE UK
+  title = html %>%
+    html_elements("[class='a-size-base a-link-normal review-title a-color-base review-title-content a-text-bold']") %>%
+    html_text2()
+  
+  # scrape review TITLE not UK
+  title = title %>%
+    c(html %>%
+        html_elements("[class='a-size-base review-title a-color-base review-title-content a-text-bold']") %>%
+        html_text2()) 
+  
+  # scrape review TEXT (UK and not-UK)
+  text = html %>%
+    html_elements("[class='a-size-base review-text review-text-content']") %>%
+    html_text2()
+  
+  # scrape review STARS (UK and not-UK)
+  star = html %>%
+    html_elements("[data-hook='review-star-rating']") %>%
+    html_text2()
+  
+  star = star %>%
+    c(html %>%
+        html_elements("[data-hook='cmps-review-star-rating']") %>%
+        html_text2())
+  
+  # Return a tibble with all the scraped data
+  tibble(title, text, star, page = page) %>%
+    return()
+}
+
+# We use the map_df function from the purrr package in order to iterate the task over multiple pages.
+id = "B0BTJ8ZXG5" 
+page = 1:39
+data_scraped = map_df(page, ~amazon_reviews(id = "B0BTJ8ZXG5", page = .))
+glimpse(data_scraped)
+
+# add a doc_id 
+data_scraped$doc_id = 1:nrow(data_scraped)
+```
+
+Actually we will use the following dataset which contains all reviews up until the 6/6/2023 for reproducibility
+```{r}
+data = readRDS(file = 'C:\\Users\\sofia\\OneDrive\\Desktop\\Lavoro\\Portfolio\\text mining\\data.rds')
+
+glimpse(data)
+```
+
+## Preprocessing 
+
+### Language detection 
+
+Since we will be using methods that are based on the english language, we remove all reviews that are not in english
+
+```{r, warning = FALSE, message = FALSE}
+library(cld2)
+```
+
+```{r}
+# apply the language detector to both title and text
+data$title_lang = detect_language(data$title)
+data$text_lang = detect_language(data$text)
+# combination of languages between title and text
+table(Text = data$text_lang, Title = data$title_lang, useNA = "always")
+
+# filter out reviews which have a text not in english
+data = data %>%
+  filter(text_lang == "en")
+tail(data)
+```
+
+### Stars of the reviews
+Let's create a new numeric variable with the number of stars saved as text in the variable `star`
+
+```{r}
+data = data %>%
+  mutate(score = as.numeric(substring(star, 1, 1)))
+summary(data$score)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(knitr)
+```
+
+```{r table}
+# table to see the number and percentage of ratings with a certain score
+tab_stars = data %>%
+  count(score) %>%
+  mutate(p = round(n/sum(n), 2))
+kable(tab_stars, align = 'l')
+```
+
+```{r, fig.width = 5, fig.height=3}
+data %>%
+  ggplot(aes(x = score)) + 
+  geom_bar(aes(y = (..count..)), fill = "darkseagreen3") +
+  labs(title = "Amazon reviews' frequencies of stars",
+       x = "Stars", y = 'frequency') + 
+  theme_minimal()+
+  theme(plot.title = element_text(color = "black", size = 12), plot.subtitle = element_text(color = "black"))
+```
+
+### Preprocessing for content and sentiment analysis
+
+```{r, warning = FALSE, message = FALSE}
+library(tidytext)
+```
+
+Tokenization 
+
+```{r}
+data = data %>% 
+  mutate(id=seq_along(text))
+head(data)
+
+tidy.data = data %>% 
+  unnest_tokens(word,text)
+```
+
+We want to make sure that we are **not removing stop words that are relevant for our analysis**. In particular, there could be words in stop words that are associated with a sentiment, removing them could alter the final results about the sentiment of our reviews. Therefore we perform an *inner join between the tokens, the stop words and also the nrc* (the lexicon that we will use in the analysis) to identify the meaningful words that would be deleted with the stopwords. 
+
+```{r}
+# inner join with stop words to asses if we want to remove all of them 
+nrc = get_sentiments ('nrc') %>% 
+  filter(sentiment %in% c('positive','negative'))
+not_stop_words = tidy.data %>% 
+  inner_join(stop_words) %>% 
+  inner_join(nrc) %>% 
+  select(word) %>% 
+  count(word,sort = T)
+```
+
+We get as an output 10 words that we proceed to remove from the stop words list so that they are not cancelled out. Now we can finally remove the remaining stop words from the tokens and further clean them. 
+
+```{r}
+# remove the just identified not stop words from the stop words 
+stop_words_1 = stop_words %>% 
+  filter(!word %in% not_stop_words$word)
+
+# further clean from meaningless tokens 
+tidy.data = tidy.data %>% 
+  anti_join(stop_words_1) %>%
+  filter(!str_detect(word,'[[:digit:]]')) %>% 
+  filter(!str_detect(word, '.\\..')) %>% 
+  filter(!str_detect(word, '^[:alpha:]{2}$')) %>% 
+  filter(!str_detect(word, '.:.'))
+```
+
+We now produce a frequency count of the most frequent words in the comments, to assess that we have removed all the meaningless words. 
+
+```{r}
+freq.df = tidy.data %>% 
+  count(word, sort = T) 
+freq.df %>% slice(1:20)
+```
+
+Better to remove words that are included in the full name of the product, as they are not conveying any additional information : "headphones", "headphone","sony", "bluetooth","wireless"
+
+```{r}
+# remove additional words
+new_stop_words = c("headphones", "headphone","sony", "bluetooth","wireless")
+tidy.data.1 = tidy.data %>% 
+  filter(!word %in% new_stop_words)
+```
+
+## Analysis of the content
+
+Let's look at the frequency plot with the most common words in the reviews
+```{r}
+freq.df.1 = tidy.data.1 %>% 
+  count(word, sort = T) 
+
+freq.df.1 %>% 
+  slice(1:20) %>%  
+  mutate(word = reorder(word,n)) %>%
+  ggplot(aes(word,n))+
+  geom_col(show.legend=F, fill = 'darkseagreen3') + 
+  xlab(NULL)+
+  ylab('frequencies')+
+  ggtitle('Most common words in reviews')+
+  coord_flip()+
+  theme_minimal()
+```
+
+## Sentiment analysis 
+
+### Choice of the lexicon
+
+Fistly we must choose the lexicon for the dictionary based method. To do so, we perform inner joins between the words that we have selected and the words in the three lexicons to see which one has the highest number of matches
+
+```{r}
+# bing 
+bing = get_sentiments('bing')
+tidy.data.1 %>% 
+  select(word) %>% 
+  unique() %>% 
+  inner_join(bing) %>% 
+  count()
+
+# nrc 
+nrc = get_sentiments ('nrc') %>% 
+  filter(sentiment %in% c('positive','negative'))
+tidy.data.1 %>% 
+  select(word) %>% 
+  unique() %>% 
+  inner_join(nrc) %>% 
+  count()
+
+# afinn 
+afinn = get_sentiments('afinn')
+tidy.data.1 %>% 
+  select(word) %>% 
+  unique() %>% 
+  inner_join(afinn) %>% 
+  count()
+```
+
+nrc is the lexicon with the highest number of matching words, therefore we will use it
+
+### nrc tidytext
+
+```{r}
+# compute the sentiments for each comment
+sent.nrc.tidy = tidy.data.1 %>% 
+  inner_join(nrc) %>% 
+  count(id,sentiment) %>%   
+  pivot_wider(names_from = sentiment,values_from = n,values_fill = 0) %>% 
+  mutate(nrc_tidy_sent = positive-negative) %>% 
+  select(id,nrc_tidy_sent)
+head(sent.nrc.tidy)
+
+# join the sentiments and the comments 
+sentiment_all_wide = sent.nrc.tidy %>%
+  full_join(data) %>% 
+  select(id,title,text,score,nrc_tidy_sent)
+
+tail(sentiment_all_wide)
+```
+
+Some comments were not assigned a polarity! We can take a closer look at them 
+```{r}
+sentiment_all_wide %>% 
+  filter(is.na(nrc_tidy_sent)) %>% 
+  select(text)
+```
+We notice that they are 10 and the reason is that their words were not contained in the nrc lexicon. However, according to human interpretation, they do have a polarity (ex. 'I like it, thank you a lot') that this method is not able to grasp. 
+
+### nrc udpipe 
+
+Use udpipe to account for negators, amplifiers and deamplifiers up to 2 words before the one that it is assessing 
+
+```{r, warning=FALSE, message = FALSE}
+library(udpipe)
+library(textdata)
+library(SnowballC)
+```
+
+```{r}
+# prepare the data for udpipe
+data$text=iconv(data$text, to= 'UTF-8')
+output=udpipe(data, "english-gum")
+
+# prepare the nrc lexicon for udpipe
+nrc = get_sentiments("nrc") %>% 
+  mutate(sentiment=ifelse(sentiment=="negative", -1, 1)) %>% 
+  rename(term="word", polarity="sentiment")
+
+# create stems 
+output1=output %>% 
+  mutate(stem=wordStem(token))
+
+# compute polarity 
+sent.nrc.udpipe=txt_sentiment(x=output, term="lemma",
+                              polarity_terms=nrc,
+                              polarity_negators = c("not","no","didn't","without","neither"),
+                              polarity_amplifiers = c("really","very","definitely","super"),
+                              polarity_deamplifiers = c("barely","hardly"),
+                              amplifier_weight=0.8,
+                              n_before=2,
+                              n_after=0,
+                              constrain=F)
+
+# add to sentiment_all_wide the polarity computed with udpipe
+sentiment_all_wide$nrc_udipipe_sent=sent.nrc.udpipe$overall$sentiment_polarity
+# still create two tibbles with the individual polarities of the two methods
+udpipe_polarity= tibble(polarity=sentiment_all_wide$nrc_udipipe_sent,method="udpipe")
+tidy_polarity= tibble(polarity=sentiment_all_wide$nrc_tidy_sent,method="tidy")
+```
+
+### Naive bayes
+
+```{r, warning=FALSE, message=FALSE}
+library(quanteda)
+library(quanteda.textmodels)
+```
+Preprocess again the data to prepare it for the Naive Bayes analysis
+```{r, eval=FALSE}
+# create the corpus object with corpus function 
+corpus = corpus(data, text_field = 'text')
+corpus = corpus %>% 
+  tokens(remove_punct = T,
+         remove_numbers = T) %>% 
+  tokens_remove(pattern = stopwords('en')) %>%  #stopwords in english 
+  tokens_wordstem()
+
+# create the document featured matrix
+dfm = dfm(corpus)
+```
+
+Prepare the training and test sets 
+```{r, eval=FALSE}
+# split the data 
+set.seed(6272)
+id_train = sample(1:nrow(data),0.7*nrow(data),replace = F) # create a vector of id of the rows that i want to select
+dfm_train = dfm %>% 
+  dfm_subset(docid(dfm) %in% id_train) 
+dfm_test = dfm %>% 
+  dfm_subset(!docid(dfm) %in% id_train)
+```
+
+Run the algorithm to predict the sentiment
+
+```{r, eval=FALSE}
+tmod_nb = textmodel_nb(dfm_train, dfm_train$sentiment)
+# in the output i get the posterior probabilities
+summary(tmod_nb) # for every stem we get the probabilities of observing them in positive and negative 
+
+# make predictions on the test set 
+dfm_match = dfm_match(dfm_test, features = featnames(dfm_train))  
+predicted_class = tmod_nb %>% 
+  predict(newdata = dfm_match)
+head(predicted_class) # predicted class for each document (we have the id of the doc)
+table(predicted_class)
+```
+
+```{r, eval=FALSE}
+############################# error ################################
+actual_class = dfm_match$sentiment 
+tab_class = table(predicted_class, actual_class)
+library(caret)
+confusionMatrix(tab_class, positive = 'positive', mode = 'everything')
+```
+
+## Polarities in the documents
+
+### Most frequent words by sentiment
+
+```{r}
+# frequency table of the sentiments by word
+word_pol_freq = tidy.data.1 %>% 
+  inner_join(nrc) %>%   
+  count(word,sentiment) %>% 
+  group_by(sentiment) %>% 
+  arrange(desc(n))
+
+# plot in two histograms by polarity (negative vs positive)
+word_pol_freq %>% 
+  filter(!sentiment == 'neutral') %>% 
+  group_by(sentiment) %>% 
+  slice_max(n, n = 7, with_ties = F) %>% 
+  ungroup() %>% 
+  mutate(word = reorder(word, n)) %>%
+  ggplot()+
+  geom_col(aes(n, word, fill= sentiment), show.legend = FALSE)+
+  facet_wrap(~sentiment, scales = "free_y")+
+  labs(x = NULL, y = NULL, title = 'Contributions of words to polarities') +
+  theme_minimal() +
+  theme(plot.title = element_text(color = "black", size = 12)) +
+  scale_fill_manual(values = c('indianred1','darkseagreen3'))
+```
+
+### Contribution of words to emotions
+```{r}
+# look at the contribution of words to emotions
+nrc11 = get_sentiments ('nrc') %>% 
+  filter(!sentiment %in% c('positive','negative'))
+
+word_pol_freq = tidy.data.1 %>% 
+  inner_join(nrc11) %>%   
+  count(word,sentiment) %>% 
+  group_by(sentiment) %>% 
+  arrange(desc(n))
+head(word_pol)
+
+word_pol_freq %>% 
+  group_by(sentiment) %>% 
+  slice_max(n, n = 7, with_ties = F) %>% 
+  ungroup() %>% 
+  mutate(word = reorder(word, n)) %>%
+  ggplot()+
+  geom_col(aes(n, word), fill= 'darkseagreen3', show.legend = FALSE)+
+  facet_wrap(~sentiment, scales = "free_y")+
+  labs(x = NULL, y = NULL, title = 'Contributions of words to emotions') +
+  theme_minimal() +
+  theme(plot.title = element_text(color = "black", size = 12)) 
+```
+
+## Model comparison 
+
+Now compare the nrc tidytext with the nrc udpipe sentiments
+
+```{r}
+sentiment_all=bind_rows(udpipe_polarity,tidy_polarity) %>% 
+  mutate(polarity_std = scale(polarity))#add standardize column
+
+# summary statistics udpipe vs tidytext
+sentiment_all %>% 
+  group_by(method) %>% 
+  summarise(mean=mean(polarity,na.rm=TRUE),
+            sd=sd(polarity,na.rm=TRUE),
+            n=n(),
+            min=min(polarity,na.rm=TRUE),
+            max=max(polarity,na.rm=TRUE))
+
+# the same but with the standardized variables
+sentiment_all %>% 
+  group_by(method) %>% 
+  summarise(mean=mean(polarity_std,na.rm=TRUE),
+            sd=sd(polarity_std,na.rm=TRUE),
+            n=n(),
+            min=min(polarity_std,na.rm=TRUE),
+            max=max(polarity_std,na.rm=TRUE)) 
+
+# overlapping histograms of the standardized polarity
+sentiment_all %>% 
+  ggplot()+
+  geom_histogram(aes(polarity_std, fill = method), alpha =0.5,position = 'identity')+
+  scale_fill_manual(values = c('red','green4')) +
+  theme_minimal()+
+  labs(x = "Standardized polarity", y = NULL, 
+       title = 'Frequency distributions of tidy and udpipe polarities', subtitle = 'Using nrc lexicon') +
+  theme(plot.title = element_text(color = "black", size = 12))
+```
+To assess the models, we assume that the scores given by the stars are the true polarity. Therefore we exploit this to see which model predicts a sentiment closer to the true polarity. 
+
+```{r}
+#----------- bar chart pos-neg_neutral
+
+# create tibble with true scores (the scores of the stars)
+scores = tibble(method = 'true_score', polarity_classes = data$score) %>% 
+  arrange(polarity_classes) %>% 
+  mutate(polarity_classes = ifelse(polarity_classes<3,'negative',
+                                   ifelse(polarity_classes>3,'positive','neutral')))
+
+# mutate the scores into polarity and bind them to sentiment all as if they were produced by another method
+sentiment_all = sentiment_all %>% 
+  arrange(polarity) %>% 
+  mutate(polarity_classes = ifelse(polarity<0,'negative',
+                                   ifelse(polarity>0,'positive','neutral'))) %>% 
+  select(method,polarity_classes) %>% 
+  bind_rows(scores)
+
+# plot the methods in dodged histogram
+sentiment_all %>% 
+  ggplot()+
+  geom_bar(aes(polarity_classes, fill = method), position = 'dodge')+
+  scale_fill_manual(values = c('indianred1','snow2','darkseagreen3')) +
+  theme_minimal()+
+  labs(x = NULL, y = NULL, 
+       title = 'Distributions of tidy and udpipe polarities by class', subtitle = 'Using nrc lexicon') +
+  theme_minimal() +
+  theme(plot.title = element_text(color = "black", size = 12))
+```
+
+What appears clearly from the plot is that the udpipe method provides polarities that match definitely more the true ones of the scores, while the tidy one gives less positives and more negatives than the true ones.
+However this doesn’t necessarily imply that udpipe gave the correct polarity to the documents, therefore we compute correlations between the two polarities of the two methods and the true scores
+
+```{r}
+#---------- correlations
+
+# correlations between the two polarities and the true scores
+sentiment_all_wide %>% 
+  filter(complete.cases(.)) %>% 
+  select(score,nrc_tidy_sent,nrc_udipipe_sent) %>% 
+  cor() %>% 
+  round(digits = 2)
+```
+The correlations are quite low in order to draw conclusions. However it is interesting to notice that they are more similar to each other, rather than to the true score. 
+We can then build confusion matrices to see specifically the mismatches. 
+
+```{r}
+#--------- confusion matrices
+
+# make sentiment_all_wide with qualitative polarities
+sentiment_all_wide = sentiment_all_wide %>% 
+  mutate(score_class = ifelse(score<3,'negative',
+                              ifelse(score>3,'positive','neutral')),
+         tidy_class = ifelse(nrc_tidy_sent<0,'negative',
+                             ifelse(nrc_tidy_sent>0,'positive','neutral')),
+         udpipe_class = ifelse(nrc_udipipe_sent<0,'negative',
+                               ifelse(nrc_udipipe_sent>0,'positive','neutral')))
+glimpse(sentiment_all_wide)
+
+#CM tidytext
+CM_tidy = table(sentiment_all_wide$tidy_class,sentiment_all_wide$score_class)
+CM_tidy
+
+#CM udpipe 
+CM_udpipe = table(sentiment_all_wide$udpipe_class,sentiment_all_wide$score_class)                                                          
+CM_udpipe
+
+# create function to compute performance indexes 
+perf_indexes = function(cm){ 
+  correct_neg = cm[1,1] / (cm[1,1] + cm[2,1] + cm[3,1])
+  correct_neu = cm[2,2] / (cm[1,2] + cm[2,2] + cm[3,2])
+  correct_pos = cm[3,3] / (cm[1,3] + cm[2,3] + cm[3,3])
+  accuracy = sum(diag(cm)) / sum(cm)
+  return(c(correct_neg=correct_neg,correct_neu=correct_neu,correct_pos=correct_pos,accuracy=accuracy))
+}
+perf_index_tidy = round(perf_indexes(CM_tidy),digits = 2)
+perf_index_tidy 
+perf_index_udpipe = round(perf_indexes(CM_udpipe),digits = 2)
+perf_index_udpipe
+```
+The udpipe method is better in identifying positive and neutral comments, while the tidy works better for negative ones (however we must point out that the true neutral value of udpipe is 0.10 and the true negative of tidytext 0.50, both being at maximum as good as random). The overall accuracy though, is higher for udpipe, so we decide that **udpipe is overall the best performer** for this context. 
+
+```{r}
+#------------- percentages of polarities in documents (udpipe)
+sentiment_all_wide %>% 
+  count(udpipe_class) %>% 
+  mutate(perc_polarity = n/nrow(sentiment_all_wide)*100)
+```
+
+Therefore, based on the udpipe classification of the documents, we can conclude that *7% of documents are negative, 12.3% are neutral and 80.7% are positive*. 
+
+```{r}
+#------------- contribution of words to the sentiment 
+nrc = get_sentiments ('nrc') %>% 
+  filter(sentiment %in% c('positive','negative'))
+```
